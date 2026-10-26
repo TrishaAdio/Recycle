@@ -57,6 +57,8 @@ def url_entities(text):
 CASES = [
     # (description, message, expected_spam?)
     ("plain hello",                      FakeMsg("hello guys"),                                False),
+    ("photo, no caption",                FakeMsg(photo=object()),                              True),
+    ("photo with caption",               FakeMsg("my dog", photo=object()),                    True),
     ("2s video",                         FakeMsg(duration=2),                                  True),
     ("4.9s video",                       FakeMsg(duration=4.9),                                True),
     ("exactly 5s video",                 FakeMsg(duration=5),                                  False),
@@ -70,7 +72,7 @@ CASES = [
     ("bit.ly short link",                FakeMsg("check bit.ly/abc"),                          True),
     ("hidden text url",                  FakeMsg("click here", entities=[MessageEntityTextUrl(0, 5, "http://bad.xyz")]), True),
     ("9s video with no link",            FakeMsg("my cat", duration=9),                        False),
-    ("photo only",                       FakeMsg(photo=object()),                              False),
+    ("sticker (not a photo)",            FakeMsg(),                                            False),
 ]
 
 
@@ -98,6 +100,27 @@ def main():
     failed += 0 if ok else 1
     print(f"\n[{'ok  ' if ok else 'FAIL'}] flood rule            "
           f"-> fast user flagged: {111 in floods}, slow user flagged: {222 in floods}")
+
+    # whitelist - must work for ids of deleted accounts, i.e. with no API call
+    import asyncio
+
+    from antispam import resolve_ids
+
+    class NoNetClient:
+        async def get_entity(self, _):
+            raise AssertionError("whitelisted numeric ids must NEVER be looked up "
+                                 "(deleted accounts cannot be resolved)")
+
+    ids = asyncio.run(resolve_ids(NoNetClient(), config.WHITELIST))
+    expected = {6522530722, 7450005478, 6687627877}
+    wl_ok = ids == expected
+    failed += 0 if wl_ok else 1
+    print(f"[{'ok  ' if wl_ok else 'FAIL'}] whitelist (offline)   -> {sorted(ids)}")
+
+    mixed_ok = asyncio.run(resolve_ids(NoNetClient(), [6522530722, "7450005478"])) == \
+        {6522530722, 7450005478}
+    failed += 0 if mixed_ok else 1
+    print(f"[{'ok  ' if mixed_ok else 'FAIL'}] numeric strings too   -> {mixed_ok}")
 
     print(f"\n{'All rules behave as expected.' if not failed else f'{failed} case(s) FAILED.'}")
     return 1 if failed else 0

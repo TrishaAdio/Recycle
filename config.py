@@ -65,9 +65,12 @@ MIN_VIDEO_DURATION = float(os.getenv("MIN_VIDEO_DURATION", "5"))
 # Leave False to judge GIFs by MIN_VIDEO_DURATION like any other video.
 BAN_ALL_GIFS = _bool("BAN_ALL_GIFS", False)
 
-# Any link posted by a non-admin counts as spam.
+# Any link posted by a non-whitelisted member counts as spam.
 # If False, only links matching SPAM_LINK_PATTERNS below count.
 BAN_ANY_LINK = _bool("BAN_ANY_LINK", True)
+
+# Any PHOTO posted by a non-whitelisted member counts as spam (caption or not).
+BAN_PHOTOS = _bool("BAN_PHOTOS", True)
 
 # Extra link patterns that are ALWAYS spam (checked even when BAN_ANY_LINK=False)
 SPAM_LINK_PATTERNS = [
@@ -98,10 +101,13 @@ SCAN_LIMIT = _int("SCAN_LIMIT", 2000)
 # Only scan messages newer than this many days. 0 = no age limit.
 SCAN_DAYS = _int("SCAN_DAYS", 30)
 
-# Never touch these users (ids or @usernames). Admins are always protected.
+# Never touch these users. Group admins and you are always protected too.
+# Raw numeric ids work even for DELETED accounts (they can't be looked up by
+# name any more, so ids are the only reliable way to whitelist them).
 WHITELIST = [
-    # 123456789,
-    # "@myfriend",
+    6522530722,
+    7450005478,
+    6687627877,
 ]
 
 # Never touch these groups (ids or @usernames).
@@ -123,8 +129,17 @@ PHOTO_CLEAN_LIMIT = _int("PHOTO_CLEAN_LIMIT", 2000)
 # Misc
 # ----------------------------------------------------------------------------
 
-# Seconds to sleep between heavy API calls (avoids FloodWait).
-API_DELAY = float(os.getenv("API_DELAY", "0.4"))
+# Seconds to sleep between heavy API calls. 0 = full speed.
+# FloodWait is still caught and retried, so 0 is safe-ish; raise it to 0.3 if
+# Telegram starts throttling you on very large group lists.
+API_DELAY = float(os.getenv("API_DELAY", "0"))
+
+# How many groups to process at the same time. Higher = faster, but more
+# chance of hitting FloodWait. 1 = the old sequential behaviour.
+CONCURRENCY = _int("CONCURRENCY", 6)
+
+# How many delete/ban calls to fire at once inside one group.
+BATCH_CONCURRENCY = _int("BATCH_CONCURRENCY", 4)
 
 # Write every action to this file as JSON lines (used by `.undo`).
 ACTION_LOG = os.getenv("ACTION_LOG", "actions.jsonl")

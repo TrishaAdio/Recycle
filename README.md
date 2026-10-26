@@ -54,17 +54,32 @@ Intended flow: `.start` → read the report → `.close all`.
 
 ## What counts as spam
 
-A message from a **non-admin** is spam when it has:
+Everyone except the whitelist and the group admins gets banned for:
 
+- **any link** (`BAN_ANY_LINK = True`) — plain urls, hidden `[text](url)` links,
+  `t.me/+invite`, shorteners, `@channel` promos
+- **any photo** (`BAN_PHOTOS = True`) — with or without a caption
 - a **video / GIF / round video shorter than 5 seconds** — a 4.9s clip is spam, a
   5s or 9s video is left alone (`MIN_VIDEO_DURATION`)
 - a GIF with no duration metadata (these are almost always spam loops)
-- a **link** — any link by default, or only the promo/shortener/invite patterns if
-  you set `BAN_ANY_LINK = False` (`SPAM_LINK_PATTERNS`)
 - **flooding** — 8 messages inside 10 seconds (`FLOOD_COUNT`, `FLOOD_WINDOW`)
 
 Once a user trips any rule, **all** of their scanned messages in that group are
 deleted, not only the offending ones, and they are banned.
+
+### Whitelist
+
+```python
+WHITELIST = [6522530722, 7450005478, 6687627877]
+```
+
+These three ids are never banned and never have messages deleted, no matter what
+they post. Numeric ids are used **as-is and never sent to the API**, which is why
+this still works for **deleted accounts** — a deleted account can't be resolved by
+username or lookup any more, so an id is the only thing that identifies it. The
+scan also labels them as `deleted account [id]` in the report instead of failing.
+
+To add more, append the numeric id (not the @username) to the list.
 
 ## Safety
 
@@ -81,13 +96,37 @@ deleted, not only the offending ones, and they are banned.
 Edit `config.py` (every value also reads an env var of the same name):
 
 ```python
+WHITELIST          = [6522530722, 7450005478, 6687627877]  # never touched
+BAN_ANY_LINK       = True  # any link = ban (False = only SPAM_LINK_PATTERNS)
+BAN_PHOTOS         = True  # any photo = ban
 MIN_VIDEO_DURATION = 5     # seconds; videos shorter than this are spam
 BAN_ALL_GIFS       = False # True = every GIF is spam regardless of length
-BAN_ANY_LINK       = True  # False = only SPAM_LINK_PATTERNS count
 SCAN_LIMIT         = 2000  # messages per group to scan
 SCAN_DAYS          = 30    # ignore messages older than this (0 = no limit)
 DELETE_PHOTO_ONLY  = True  # delete captionless photos during `.close all`
 ```
+
+## Speed
+
+The scan runs groups **in parallel** and is tuned to be fast:
+
+```python
+CONCURRENCY       = 6   # groups scanned at the same time
+BATCH_CONCURRENCY = 4   # delete/ban calls in flight per group
+API_DELAY         = 0   # no artificial pause between calls
+```
+
+Other things that keep it quick: offender names come from the messages already
+downloaded (zero extra lookups), deletions go out in parallel batches of 100,
+`SCAN_DAYS` stops each group early instead of walking the whole history, and
+whitelisted ids are filtered during the scan so they cost nothing.
+
+The report ends with the wall-clock time, e.g.
+`Done in 12.4s — banned 37, deleted 1904 message(s) across 23 group(s).`
+
+If Telegram starts throttling you (you'll see `[floodwait] sleeping Ns` in the
+console), lower `CONCURRENCY` to 2-3 or set `API_DELAY = 0.3`. FloodWait is
+always caught and retried, so a scan won't die from it either way.
 
 After changing the rules, verify them without touching Telegram:
 

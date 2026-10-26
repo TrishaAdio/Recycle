@@ -96,7 +96,8 @@ async def safe(coro_factory, retries=3):
     for attempt in range(retries):
         try:
             await coro_factory()
-            await asyncio.sleep(config.API_DELAY)
+            if config.API_DELAY > 0:
+                await asyncio.sleep(config.API_DELAY)
             return True, None
         except FloodWaitError as e:
             wait = min(e.seconds + 2, 300)
@@ -175,6 +176,10 @@ def classify(msg):
         # animation with no duration metadata -> treat as a short GIF
         return "GIF (no duration metadata)"
 
+    # --- photos ------------------------------------------------------------
+    if config.BAN_PHOTOS and getattr(msg, "photo", None):
+        return "photo posted by member"
+
     # --- links -------------------------------------------------------------
     # known spam patterns are always checked, even if nothing looks like a link
     blob = link_text(msg)
@@ -204,17 +209,26 @@ def find_floods(messages_by_user):
 
 
 async def resolve_ids(client, items):
-    """Turn a mixed list of ids/@usernames into a set of ids."""
+    """Turn a mixed list of ids/@usernames into a set of ids.
+
+    Numeric entries (including numeric strings) are used as-is and never sent
+    to the API - that is what makes whitelisting DELETED accounts work, since
+    a deleted account can no longer be resolved by username or lookup.
+    """
     ids = set()
     for item in items or []:
         if isinstance(item, int):
             ids.add(item)
             continue
+        text = str(item).strip()
+        if text.lstrip("-").isdigit():
+            ids.add(int(text))
+            continue
         try:
-            ent = await client.get_entity(item)
+            ent = await client.get_entity(text)
             ids.add(ent.id)
         except Exception as e:  # noqa: BLE001
-            print(f"[warn] cannot resolve {item!r}: {e}")
+            print(f"[warn] cannot resolve {text!r}: {e} — use the numeric id instead")
     return ids
 
 
@@ -266,6 +280,19 @@ def human(user):
     return f"{name or uname or user.id} [{user.id}]"
 
 
+def sender_name(msg, uid):
+    """Display name taken from the message itself - costs zero extra API calls.
+
+    Deleted accounts have no name left, so they show up as "deleted account".
+    """
+    user = getattr(msg, "sender", None)
+    if user is None:
+        return f"user [{uid}]"
+    if getattr(user, "deleted", False):
+        return f"deleted account [{uid}]"
+    return human(user)
+
+
 async def edit_status(msg, text):
     try:
         await msg.edit(text[:4000])
@@ -302,93 +329,133 @@ async def run_scan(client, status_msg, target=None, dry=False):
     mode = "DRY RUN (nothing will be touched)" if dry else "LIVE"
     report = [f"**Anti-spam scan — {mode}**", f"groups: {len(groups)}", ""]
     bans_done = []
-    total_banned = total_deleted = 0
     skipped = []
+    sections = []                       # (group index, [lines]) - keeps order
+    stat = {"banned": 0, "deleted": 0, "done": 0, "hits": 0}
+    t0 = time.monotonic()
 
-    for gi, d in enumerate(groups, 1):
+    group_sem = asyncio.Semaphore(max(1, config.CONCURRENCY))
+    batch_sem = asyncio.Semaphore(max(1, config.BATCH_CONCURRENCY))
+
+    async def punish(chat, uid, ids, uniq, can_ban, can_del):
+        """Delete the user's messages (parallel chunks) then ban them."""
+        deleted = 0
+        if can_del and ids:
+            chunks = [ids[i:i + 100] for i in range(0, len(ids), 100)]
+
+            async def del_chunk(c):
+                async with batch_sem:
+                    return await safe(lambda: client.delete_messages(chat, c))
+
+            for chunk, (okd, _) in zip(chunks, await asyncio.gather(*(del_chunk(c) for c in chunks))):
+                if okd:
+                    deleted += len(chunk)
+            stat["deleted"] += deleted
+            log_action("delete", chat=chat.id, user=uid, count=deleted)
+
+        banned_ok, berr = False, None
+        if can_ban:
+            async with batch_sem:
+                banned_ok, berr = await safe(
+                    lambda: client.edit_permissions(chat, uid, until_date=None, view_messages=False))
+            if banned_ok:
+                stat["banned"] += 1
+                bans_done.append((chat.id, uid))
+                log_action("ban", chat=chat.id, user=uid, reasons=uniq)
+        return deleted, banned_ok, berr
+
+    async def scan_group(idx, d):
         chat = d.entity
         title = getattr(chat, "title", str(chat.id))
-        await edit_status(status_msg, f"🔍 Scanning {gi}/{len(groups)}\n`{title}`\n\nbanned: {total_banned} | deleted: {total_deleted}")
-
-        can_ban, can_del, creator = await my_rights(client, chat)
-        if not (can_ban or can_del):
-            skipped.append(f"• `{title}` — I'm not an admin there")
-            continue
-
-        protected = await admin_ids(client, chat) | whitelist
-        offences = defaultdict(list)       # uid -> [reason, ...]
-        msg_ids = defaultdict(list)        # uid -> [message id, ...]
-        by_user = defaultdict(list)        # uid -> [message, ...] (flood check)
-
-        try:
-            async for msg in client.iter_messages(chat, limit=config.SCAN_LIMIT):
-                if cutoff and msg.date < cutoff:
-                    break
-                uid = msg.sender_id
-                if not uid or uid in protected or uid < 0:
-                    continue
-                by_user[uid].append(msg)
-                msg_ids[uid].append(msg.id)
-                reason = classify(msg)
-                if reason:
-                    offences[uid].append(reason)
-        except Exception as e:  # noqa: BLE001
-            skipped.append(f"• `{title}` — read failed: {type(e).__name__}")
-            continue
-
-        for uid, reason in find_floods(by_user).items():
-            if uid not in protected:
-                offences[uid].append(reason)
-
-        if not offences:
-            continue
-
-        report.append(f"**{title}**")
-        for uid, reasons in offences.items():
+        async with group_sem:
             try:
-                user = await client.get_entity(uid)
-            except Exception:  # noqa: BLE001
-                user = None
-            uniq = sorted(set(reasons))
-            ids = msg_ids[uid]
-            report.append(f"  · {human(user)} — {len(reasons)} spam msg(s): {', '.join(uniq[:3])}")
+                can_ban, can_del, _creator = await my_rights(client, chat)
+                if not (can_ban or can_del):
+                    skipped.append(f"• `{title}` — I'm not an admin there")
+                    return
+                admins = await admin_ids(client, chat)
+                protected = admins | whitelist
 
-            if dry:
-                report[-1] += f" → would delete {len(ids)} msg(s) + ban"
-                continue
+                offences = defaultdict(list)   # uid -> [reason, ...]
+                msg_ids = defaultdict(list)    # uid -> [message id, ...]
+                by_user = defaultdict(list)    # uid -> [message, ...] for flood
+                names = {}                     # uid -> display name (free, from the message)
 
-            # 1. delete every message of that user we collected
-            deleted = 0
-            if can_del:
-                for i in range(0, len(ids), 100):
-                    chunk = ids[i:i + 100]
-                    ok, err = await safe(lambda c=chunk: client.delete_messages(chat, c))
-                    if ok:
-                        deleted += len(chunk)
-                total_deleted += deleted
-                log_action("delete", chat=chat.id, user=uid, count=deleted)
+                try:
+                    async for msg in client.iter_messages(chat, limit=config.SCAN_LIMIT):
+                        if cutoff and msg.date < cutoff:
+                            break
+                        uid = msg.sender_id
+                        # skip service msgs, channel/anonymous senders and protected ids
+                        if not uid or uid < 0 or uid in protected:
+                            continue
+                        by_user[uid].append(msg)
+                        msg_ids[uid].append(msg.id)
+                        if uid not in names:
+                            names[uid] = sender_name(msg, uid)
+                        reason = classify(msg)
+                        if reason:
+                            offences[uid].append(reason)
+                except Exception as e:  # noqa: BLE001
+                    skipped.append(f"• `{title}` — read failed: {type(e).__name__}")
+                    return
 
-            # 2. ban
-            banned_ok = False
-            if can_ban:
-                ok, err = await safe(lambda u=uid: client.edit_permissions(chat, u, until_date=None, view_messages=False))
-                banned_ok = ok
-                if ok:
-                    total_banned += 1
-                    bans_done.append((chat.id, uid))
-                    log_action("ban", chat=chat.id, user=uid, reasons=uniq)
-                else:
-                    report[-1] += f" → ban failed ({err})"
+                for uid, reason in find_floods(by_user).items():
+                    if uid not in protected:
+                        offences[uid].append(reason)
 
-            report[-1] += f" → deleted {deleted}" + (" + banned ✅" if banned_ok else "")
-        report.append("")
+                if not offences:
+                    return
+
+                stat["hits"] += len(offences)
+                lines = [f"**{title}**"]
+                for uid, reasons in offences.items():
+                    uniq = sorted(set(reasons))
+                    ids = msg_ids[uid]
+                    line = (f"  · {names.get(uid, uid)} — {len(reasons)} spam msg(s): "
+                            f"{', '.join(uniq[:3])}")
+                    if dry:
+                        lines.append(line + f" → would delete {len(ids)} msg(s) + ban")
+                        continue
+                    deleted, banned_ok, berr = await punish(chat, uid, ids, uniq, can_ban, can_del)
+                    line += f" → deleted {deleted}"
+                    line += " + banned ✅" if banned_ok else f" + ban failed ({berr})"
+                    lines.append(line)
+                lines.append("")
+                sections.append((idx, lines))
+            finally:
+                stat["done"] += 1
+
+    async def progress():
+        while True:
+            await asyncio.sleep(2.5)
+            el = time.monotonic() - t0
+            await edit_status(
+                status_msg,
+                f"🔍 Scanning… {stat['done']}/{len(groups)} groups  ({el:.0f}s)\n"
+                f"spammers found: {stat['hits']}\n"
+                f"banned: {stat['banned']} | messages deleted: {stat['deleted']}")
+
+    ticker = asyncio.ensure_future(progress())
+    try:
+        await asyncio.gather(*(scan_group(i, d) for i, d in enumerate(groups)),
+                             return_exceptions=True)
+    finally:
+        ticker.cancel()
+
+    for _idx, lines in sorted(sections, key=lambda x: x[0]):
+        report.extend(lines)
+
+    total_banned, total_deleted = stat["banned"], stat["deleted"]
+    elapsed = time.monotonic() - t0
 
     if skipped:
         report.append("**Skipped**")
         report.extend(skipped)
         report.append("")
 
-    report.append(f"**Done — banned {total_banned}, deleted {total_deleted} message(s).**")
+    report.append(f"**Done in {elapsed:.1f}s — banned {total_banned}, "
+                  f"deleted {total_deleted} message(s) across {len(groups)} group(s).**")
     if dry:
         report.append("_Dry run: nothing was changed. Run `.start` to apply._")
     else:
@@ -517,10 +584,12 @@ HELP = """**Anti-spam userbot**
 `.help`           this message
 
 **Spam rules**
-• video / GIF / round video shorter than {dur:g}s → spam (a 9s video stays)
-• spam / promo links from non-admins → spam
-• {flood} messages in {win}s from one user → spam
-Admins, the whitelist and you are never touched."""
+• any link → ban + delete
+• any photo → ban + delete
+• video / GIF / round video shorter than {dur:g}s → ban (a 9s video stays)
+• {flood} messages in {win}s from one user → ban
+Never touched: group admins, you, and these whitelisted ids:
+{wl}"""
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +616,9 @@ def main():
 
         if cmd == "help":
             await edit_status(status, HELP.format(
-                dur=config.MIN_VIDEO_DURATION, flood=config.FLOOD_COUNT, win=config.FLOOD_WINDOW))
+                dur=config.MIN_VIDEO_DURATION, flood=config.FLOOD_COUNT,
+                win=config.FLOOD_WINDOW,
+                wl="\n".join(f"  `{u}`" for u in config.WHITELIST) or "  (none)"))
             return
 
         if cmd == "report":
